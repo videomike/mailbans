@@ -6,6 +6,10 @@
 - pro Mailclient (über IMAP-ID-Command erkannt): Name, Anzahl, Zeitspanne;
   der Client mit dem zuletzt aufgetretenen Failure wird ROT markiert
 - TLS-Cipher und Auth-Methode des letzten Versuchs
+
+Bei interaktiver Ausführung (TTY) bietet das Skript am Ende an, Bans
+zu entfernen: bis 10 IPs einzeln per Nummer, ab 11 IPs als Bulk-Unban
+mit Warnhinweis.
 """
 
 import glob
@@ -19,7 +23,10 @@ from datetime import datetime
 LOGS = sorted(glob.glob('/var/log/dovecot/*.log')) + ['/var/log/mail.log']
 JAILS = ['dovecot', 'postfix', 'postfix-sasl', 'sogo', 'nginx-http-auth']
 
-BOLD, DIM, RED, CYAN, RESET = '\033[1m', '\033[2m', '\033[31m', '\033[36m', '\033[0m'
+BOLD, DIM, RED, CYAN, YELLOW, RESET = (
+    '\033[1m', '\033[2m', '\033[31m', '\033[36m', '\033[33m', '\033[0m')
+
+INDIVIDUAL_PROMPT_LIMIT = 10
 
 TS_RE = re.compile(r'^([0-9-]{10}T[0-9:]{8})')
 SESSION_RE = re.compile(r'session=<([^>]+)>')
@@ -120,9 +127,10 @@ def build_session_to_client(log_lines):
     return mapping
 
 
-def render_ip(jail, ip, log_lines, session_to_client):
+def render_ip(jail, ip, log_lines, session_to_client, idx=None):
     ptr = reverse_dns(ip)
-    head = f'\n{BOLD}[{jail}]{RESET} {ip}'
+    prefix = f'{BOLD}{idx:>2})  {RESET}' if idx is not None else ''
+    head = f'\n{prefix}{BOLD}[{jail}]{RESET} {ip}'
     if ptr:
         head += f'  ({ptr})'
     print(head)
@@ -181,24 +189,87 @@ def render_ip(jail, ip, log_lines, session_to_client):
         print(f'   {DIM}Last: {", ".join(hints)}{RESET}')
 
 
+def unban(ip):
+    """Remove `ip` from all jails. Prints the result."""
+    try:
+        r = subprocess.run(['fail2ban-client', 'unban', ip],
+                           capture_output=True, text=True, timeout=5)
+        out = (r.stdout + r.stderr).strip()
+        print(f'  → unban {ip}: {out}')
+    except Exception as e:
+        print(f'  → unban {ip}: error {e}')
+
+
+def prompt_individual(bans):
+    """For ≤10 bans: ask which numbers to unban (comma-separated)."""
+    try:
+        answer = input(
+            f'\nEntsperren? Nummer(n) kommagetrennt — Enter = nichts: ').strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if not answer:
+        return
+    selected = []
+    for tok in answer.split(','):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            n = int(tok)
+        except ValueError:
+            print(f'  Ignoriere "{tok}" — keine Zahl.')
+            continue
+        if not 1 <= n <= len(bans):
+            print(f'  Ignoriere {n} — außerhalb 1..{len(bans)}.')
+            continue
+        selected.append(n)
+    for n in selected:
+        _, ip = bans[n - 1]
+        unban(ip)
+
+
+def prompt_bulk(bans):
+    """For >10 bans: confirm bulk unban with explicit warning."""
+    n = len(bans)
+    print(f'\n{YELLOW}{n} IPs gesperrt. Bulk-Unban entsperrt auch aktive '
+          f'Brute-Force-Versuche — in der Regel nicht empfohlen.{RESET}')
+    try:
+        answer = input(f'Trotzdem alle {n} entsperren? [y/N]: ').strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if answer in ('y', 'yes', 'j', 'ja'):
+        for _, ip in bans:
+            unban(ip)
+
+
 def main():
     log_lines = load_logs()
     session_to_client = build_session_to_client(log_lines)
 
-    # --debug-ip <IP> [<IP> ...]: simulate bans for testing
+    # --debug-ip <IP> [<IP> ...]: simulate bans for testing (no unban prompt)
     if len(sys.argv) > 2 and sys.argv[1] == '--debug-ip':
-        for ip in sys.argv[2:]:
-            render_ip('debug', ip, log_lines, session_to_client)
+        for idx, ip in enumerate(sys.argv[2:], start=1):
+            render_ip('debug', ip, log_lines, session_to_client, idx=idx)
         return
 
-    any_ban = False
-    for jail in JAILS:
-        for ip in banned_ips(jail):
-            any_ban = True
-            render_ip(jail, ip, log_lines, session_to_client)
-
-    if not any_ban:
+    bans = [(jail, ip) for jail in JAILS for ip in banned_ips(jail)]
+    if not bans:
         print('Keine aktiven Bans.')
+        return
+
+    for idx, (jail, ip) in enumerate(bans, start=1):
+        render_ip(jail, ip, log_lines, session_to_client, idx=idx)
+
+    # Interactive prompt only when stdin is a TTY (skip when piped/cron).
+    if not sys.stdin.isatty():
+        return
+
+    if len(bans) <= INDIVIDUAL_PROMPT_LIMIT:
+        prompt_individual(bans)
+    else:
+        prompt_bulk(bans)
 
 
 if __name__ == '__main__':

@@ -14,6 +14,13 @@ Lists every currently banned IP across all relevant fail2ban jails (`dovecot`, `
 - **Per mail client**, identified via Dovecot’s logged IMAP-ID command (RFC 2971) and linked to failures via the dovecot session-id: name, version, OS, plus failure count and time range. The client with the **most recently observed failure** is highlighted in red — useful when fixing passwords across multiple devices: at the end, only the one device still misconfigured stays red.
 - TLS cipher and SASL method of the most recent attempt
 
+When run interactively (TTY) `mailbans` finishes with a prompt:
+
+- **≤10 banned IPs**: each IP is numbered, and you can enter one or more numbers (comma-separated) to unban — or just press Enter to do nothing.
+- **>10 banned IPs**: a yes/no bulk-unban prompt with an explicit warning, since clearing every ban also lifts active brute-force lockouts.
+
+The prompt is suppressed when stdin is not a TTY (so `mailbans` is safe to run from cron or pipes).
+
 Sample output:
 
 ```
