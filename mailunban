@@ -1,0 +1,4 @@
+#!/bin/bash
+# mailunban — remove an IP from all fail2ban jails on this host.
+[ -z "$1" ] && { echo "Usage: mailunban <IP>"; exit 1; }
+fail2ban-client unban "$1"

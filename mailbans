@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""mailbans — listet aktive fail2ban-Sperren auf dem Mailserver mit:
+- Reverse-DNS pro IP
+- Auth-Failure-User mit Häufigkeit
+- Gesamt-Zeitspanne der Fehlversuche
+- pro Mailclient (über IMAP-ID-Command erkannt): Name, Anzahl, Zeitspanne;
+  der Client mit dem zuletzt aufgetretenen Failure wird ROT markiert
+- TLS-Cipher und Auth-Methode des letzten Versuchs
+"""
+
+import glob
+import re
+import socket
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import datetime
+
+LOGS = sorted(glob.glob('/var/log/dovecot/*.log')) + ['/var/log/mail.log']
+JAILS = ['dovecot', 'postfix', 'postfix-sasl', 'sogo', 'nginx-http-auth']
+
+BOLD, DIM, RED, CYAN, RESET = '\033[1m', '\033[2m', '\033[31m', '\033[36m', '\033[0m'
+
+TS_RE = re.compile(r'^([0-9-]{10}T[0-9:]{8})')
+SESSION_RE = re.compile(r'session=<([^>]+)>')
+
+
+def banned_ips(jail):
+    try:
+        out = subprocess.run(['fail2ban-client', 'status', jail],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return []
+    for line in out.splitlines():
+        if 'Banned IP list:' in line:
+            return line.split(':', 1)[1].strip().split()
+    return []
+
+
+def reverse_dns(ip):
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except Exception:
+        return None
+
+
+def fmt_duration(secs):
+    if secs < 60:
+        return f'{secs}s'
+    if secs < 3600:
+        return f'{secs // 60} min {secs % 60} s'
+    return f'{secs // 3600} h {(secs % 3600) // 60} min'
+
+
+def parse_client(raw):
+    """'name=Foo, version=Bar (build), os=Baz, os-version=Qux (b), vendor=Quux'
+       → 'Foo Bar (Baz Qux)' (omits the OS parens if both fields are empty)."""
+    fields = {}
+    for part in raw.split(', '):
+        if '=' in part:
+            k, v = part.split('=', 1)
+            fields[k.strip()] = v.strip()
+    name = fields.get('name', '?')
+    ver = fields.get('version', '').split(' ')[0]
+    os_name = fields.get('os', '')
+    os_ver = fields.get('os-version', '').split(' ')[0]
+    head = f'{name} {ver}'.strip()
+    os_part = f'{os_name} {os_ver}'.strip()
+    return f'{head} ({os_part})' if os_part else head
+
+
+def fmt_range(timestamps):
+    """Returns 'date  HH:MM:SS – HH:MM:SS (dur)' or 'iso – iso (dur)' across days."""
+    timestamps = sorted(timestamps)
+    first, last = timestamps[0], timestamps[-1]
+    fd, ft = first.split('T')
+    ld, lt = last.split('T')
+    dur = fmt_duration(int(datetime.fromisoformat(last).timestamp())
+                       - int(datetime.fromisoformat(first).timestamp()))
+    if fd == ld:
+        return f'{fd}  {ft} – {lt} ({dur})'
+    return f'{first} – {last} ({dur})'
+
+
+def short_range(timestamps):
+    """Returns 'HH:MM:SS – HH:MM:SS (dur)' — for per-client lines, where the
+       overall date is already shown above."""
+    timestamps = sorted(timestamps)
+    first, last = timestamps[0], timestamps[-1]
+    dur = fmt_duration(int(datetime.fromisoformat(last).timestamp())
+                       - int(datetime.fromisoformat(first).timestamp()))
+    return f'{first.split("T")[1]} – {last.split("T")[1]} ({dur})'
+
+
+def load_logs():
+    lines = []
+    for f in LOGS:
+        try:
+            with open(f, errors='replace') as fh:
+                lines.extend(fh)
+        except FileNotFoundError:
+            pass
+    return lines
+
+
+def build_session_to_client(log_lines):
+    """Map dovecot session-id → raw client ID-string."""
+    mapping = {}
+    for line in log_lines:
+        if 'ID sent:' not in line:
+            continue
+        sess_m = SESSION_RE.search(line)
+        if not sess_m:
+            continue
+        idx = line.find('ID sent: ') + len('ID sent: ')
+        rest = line[idx:].rstrip('\n')
+        # Two possible terminators: "...:user=<...>" (pre-login) or end-of-line (post-login)
+        m = re.search(r'^(.+?):\s+user=<', rest)
+        mapping[sess_m.group(1)] = (m.group(1) if m else rest).strip()
+    return mapping
+
+
+def render_ip(jail, ip, log_lines, session_to_client):
+    ptr = reverse_dns(ip)
+    head = f'\n{BOLD}[{jail}]{RESET} {ip}'
+    if ptr:
+        head += f'  ({ptr})'
+    print(head)
+
+    ip_lines = [l for l in log_lines if ip in l]
+    failures = [l for l in ip_lines
+                if 'auth failed' in l.lower() or 'authentication failed' in l.lower()]
+    if not failures:
+        return
+
+    # User aggregation
+    user_counts = defaultdict(int)
+    for l in failures:
+        for m in re.finditer(r'user=<[^>]+>|sasl_username=[^ ,]+', l):
+            user_counts[m.group(0)] += 1
+    for user, cnt in sorted(user_counts.items(), key=lambda x: -x[1])[:5]:
+        print(f'   {cnt:>3} {user}')
+
+    # Collect (timestamp, session) tuples
+    records = []
+    for l in failures:
+        ts_m, sess_m = TS_RE.match(l), SESSION_RE.search(l)
+        if ts_m:
+            records.append((ts_m.group(1), sess_m.group(1) if sess_m else None))
+
+    timestamps = [ts for ts, _ in records]
+    if timestamps:
+        print(f'   {DIM}{len(timestamps)} Failures, {fmt_range(timestamps)}{RESET}')
+
+    # Group by client (via session ID)
+    by_client = defaultdict(list)
+    unknown = []
+    for ts, sess in records:
+        client = session_to_client.get(sess) if sess else None
+        (by_client[client] if client else unknown).append(ts)
+
+    if by_client:
+        latest_overall = max(t for ts_list in by_client.values() for t in ts_list)
+        # Sort: most-recent failure first
+        items = sorted(by_client.items(), key=lambda x: max(x[1]), reverse=True)
+        for raw, times in items:
+            color = RED if max(times) == latest_overall else CYAN
+            print(f'   {color}Client: {parse_client(raw)} — '
+                  f'{len(times)}× {short_range(times)}{RESET}')
+
+    if unknown:
+        print(f'   {DIM}Client unknown (kein ID-Command): '
+              f'{len(unknown)}× {short_range(unknown)}{RESET}')
+
+    # Last attempt's TLS + auth method
+    last_line = max(failures, key=lambda l: TS_RE.match(l).group(1) if TS_RE.match(l) else '')
+    tls_m = re.search(r'TLSv[0-9.]+ with cipher [A-Z0-9_-]+', last_line)
+    meth_m = re.search(r'method=[A-Z]+', last_line)
+    hints = [m.group(0) for m in (tls_m, meth_m) if m]
+    if hints:
+        print(f'   {DIM}Last: {", ".join(hints)}{RESET}')
+
+
+def main():
+    log_lines = load_logs()
+    session_to_client = build_session_to_client(log_lines)
+
+    # --debug-ip <IP> [<IP> ...]: simulate bans for testing
+    if len(sys.argv) > 2 and sys.argv[1] == '--debug-ip':
+        for ip in sys.argv[2:]:
+            render_ip('debug', ip, log_lines, session_to_client)
+        return
+
+    any_ban = False
+    for jail in JAILS:
+        for ip in banned_ips(jail):
+            any_ban = True
+            render_ip(jail, ip, log_lines, session_to_client)
+
+    if not any_ban:
+        print('Keine aktiven Bans.')
+
+
+if __name__ == '__main__':
+    main()
